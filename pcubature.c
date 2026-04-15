@@ -30,9 +30,14 @@
 
 #include "cubature.h"
 
-/* error return codes */
-#define SUCCESS 0
-#define FAILURE 1
+/* error return codes. NOT_CONVERGED: third status distinct from
+   SUCCESS and FAILURE, returned when the main loop hits maxEval
+   without satisfying the requested tolerance. val[] still holds the
+   best available estimate and err[] the (possibly large) final
+   error. See CUBATURE_NOT_CONVERGED in cubature.h. */
+#define SUCCESS        0
+#define FAILURE        1
+#define NOT_CONVERGED  2
 
 /* pre-generated Clenshaw-Curtis rules and weights */
 #include "clencurt.h"
@@ -347,9 +352,13 @@ int pcubature_v_buf(unsigned fdim, integrand_v f, void *fdata,
 	  unsigned mi;
 
 	  eval_integral(vc, m, fdim, dim, V, &mi, val, err, val1);
-	  if (converged(fdim, val, err, reqAbsError, reqRelError, norm)
-	      || (numEval > maxEval && maxEval)) {
+	  if (converged(fdim, val, err, reqAbsError, reqRelError, norm)) {
 	       ret = SUCCESS;
+	       goto done;
+	  }
+	  if (numEval > maxEval && maxEval) {
+	       /* ran out of budget without meeting tolerance */
+	       ret = NOT_CONVERGED;
 	       goto done;
 	  }
 	  m[mi] += 1;
@@ -398,6 +407,38 @@ int pcubature_v(unsigned fdim, integrand_v f, void *fdata,
      return ret;
 }
 
+/* Robust variant: start Clenshaw-Curtis at a denser initial order in
+   every dimension so that the first convergence check sees a grid
+   that is less likely to structurally miss localized integrand
+   features. The value `robust` is interpreted as the minimum starting
+   order m for every dimension (so robust=2 → 9 points per dim at
+   first evaluation; robust=3 → 17 points per dim). Default (robust=0)
+   behavior is identical to pcubature_v. This is an opt-in safety net;
+   it makes the failing case from hcubature's fool's-convergence test
+   at least *partially* recoverable at a cost proportional to
+   (2^(robust+1)+1)^dim function evaluations up front. It does NOT
+   promise correctness on pathologically localized integrands -- for
+   those, use hcubature(..., robust = TRUE) or Cuba's cuhre/divonne. */
+int pcubature_v_robust(unsigned fdim, integrand_v f, void *fdata,
+		       unsigned dim, const double *xmin, const double *xmax,
+		       size_t maxEval, double reqAbsError, double reqRelError,
+		       error_norm norm,
+		       double *val, double *err, int robust)
+{
+     int ret;
+     size_t nbuf = 0;
+     unsigned m[MAXDIM];
+     unsigned i;
+     unsigned m0 = (robust > 0) ? (unsigned)robust : 0;
+     double *buf = NULL;
+     for (i = 0; i < dim; ++i) m[i] = m0;
+     ret = pcubature_v_buf(fdim, f, fdata, dim, xmin, xmax,
+				  maxEval, reqAbsError, reqRelError, norm,
+				  m, &buf, &nbuf, DEFAULT_MAX_NBUF, val, err);
+     free(buf);
+     return ret;
+}
+
 #include "vwrapper.h"
 
 int pcubature(unsigned fdim, integrand f, void *fdata,
@@ -415,9 +456,34 @@ int pcubature(unsigned fdim, integrand f, void *fdata,
      d.f = f; d.fdata = fdata;
      memset(m, 0, sizeof(unsigned) * dim);
      ret = pcubature_v_buf(
-	  fdim, fv, &d, dim, xmin, xmax, 
+	  fdim, fv, &d, dim, xmin, xmax,
 	  maxEval, reqAbsError, reqRelError, norm,
 	  m, &buf, &nbuf, 16 /* max_nbuf > 0 to amortize function overhead */,
+	  val, err);
+     free(buf);
+     return ret;
+}
+
+int pcubature_robust(unsigned fdim, integrand f, void *fdata,
+		     unsigned dim, const double *xmin, const double *xmax,
+		     size_t maxEval, double reqAbsError, double reqRelError,
+		     error_norm norm,
+		     double *val, double *err, int robust)
+{
+     int ret;
+     size_t nbuf = 0;
+     unsigned m[MAXDIM];
+     unsigned i;
+     unsigned m0 = (robust > 0) ? (unsigned)robust : 0;
+     double *buf = NULL;
+     fv_data d;
+
+     d.f = f; d.fdata = fdata;
+     for (i = 0; i < dim; ++i) m[i] = m0;
+     ret = pcubature_v_buf(
+	  fdim, fv, &d, dim, xmin, xmax,
+	  maxEval, reqAbsError, reqRelError, norm,
+	  m, &buf, &nbuf, 16,
 	  val, err);
      free(buf);
      return ret;

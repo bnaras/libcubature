@@ -7,9 +7,7 @@ package for **adaptive multidimensional integration** (*cubature*) of
 [Steven G. Johnson](http://math.mit.edu/~stevenj).  That is, it computes
 integrals of the form:
 
-```math
-\int_{a_1}^{b_1} \int_{a_2}^{b_2} \cdots \int_{a_n}^{b_n} \vec{f}(\vec{x}) d^n \vec{x}
-```
+![n-dimensional integral](doc/integral.png)
 
 (Of course, it can handle scalar integrands as the special case where
 f is a one-dimensional vector: the dimensionalities of f
@@ -317,18 +315,14 @@ Integrals over infinite or semi-infinite intervals is possible by a
 best illustrated in one dimension.
 
 To compute an integral over a semi-infinite interval, you can perform
-the change of variables $x=a+\frac{t}{1-t}$:
+the change of variables x=a+t/(1-t):
 
-```math
-\int_a^\infty f(x) dx = \int_0^1 f \left( a + \frac{t}{1-t} \right) \frac{1}{(1-t)^2} dt
-```
+![semi-infinite integral](doc/semi-infinite.png)
 
 For an infinite interval, you can perform the change of variables
-$x=\frac{t}{1-t^2}$:
+x=t/(1-t²):
 
-```math
-\int_{-\infty}^\infty f(x) dx = \int_{-1}^1 f \left( \frac{t}{1-t^2} \right) \frac{1+t^2}{(1-t^2)^2} dt
-```
+![infinite integral](doc/infinite.png)
 
 Note the [Jacobian](w:Jacobian_matrix "wikilink") factors multiplying
 *f*(⋅⋅⋅) in both integrals, and also that the limits of the *t*

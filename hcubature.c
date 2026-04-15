@@ -26,6 +26,10 @@
  *
  */
 
+#ifdef _R_INTERFACE
+#include <R.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,9 +109,16 @@
 
 #include "cubature.h"
 
-/* error return codes */
-#define SUCCESS 0
-#define FAILURE 1
+/* error return codes. NOT_CONVERGED is a third status, distinct from
+   SUCCESS and FAILURE, returned when the main adaptive loop exhausts
+   its maxEval budget before the requested tolerance is met. The
+   output val[] still holds the best estimate and err[] the final
+   (possibly too-large) error; callers should inspect returnCode and
+   treat NOT_CONVERGED as "best effort, not guaranteed." See
+   CUBATURE_NOT_CONVERGED in cubature.h. */
+#define SUCCESS        0
+#define FAILURE        1
+#define NOT_CONVERGED  2
 
 /***************************************************************************/
 /* Basic datatypes */
@@ -437,6 +448,14 @@ typedef struct {
      /* dimension-dependent constants */
      double weight1, weight3, weight5;
      double weightE1, weightE3;
+     /* weights of a degree-3 embedded rule using only (val0, sum2):
+        weight3rd_1 = 1 - 70*dim/27, weight3rd_2 = 35/27. The functional
+        |res3rd - result| is a degree-3 null rule difference and is used
+        (together with the existing degree-5 null rule |res5th - result|)
+        to form a robust error estimate when the `robust` flag is set.
+        See Berntsen, Espelid & Genz, ACM TOMS 17(4), 437-451 (1991). */
+     double weight3rd_1, weight3rd_2;
+     int robust;
 	 double df_scale;
 } rule75genzmalik;
 
@@ -554,7 +573,26 @@ static int rule75genzmalik_evalError(rule *r_, unsigned fdim, integrand_v f, voi
 	       res5th = R[iR].h.vol * (r->weightE1 * val0 + weightE2 * sum2 + r->weightE3 * sum3 + weightE4 * sum4);
 
 	       R[iR].ee[j].val = result;
-	       R[iR].ee[j].err = fabs(res5th - result);
+
+	       if (r->robust) {
+		    /* Additional degree-3 rule using only (val0, sum2).
+		       The difference |res3rd - result| is a degree-3 null
+		       rule estimate. We combine with the degree-5 null rule
+		       using the Cuhre-style decay-check formula: for smooth
+		       integrands the higher-degree null rule should decay
+		       by a factor >= 5; if it does, trust it; otherwise use
+		       the worst and inflate by a safety factor. */
+		    double res3rd = R[iR].h.vol
+			 * (r->weight3rd_1 * val0 + r->weight3rd_2 * sum2);
+		    double err5 = fabs(res5th - result);
+		    double err3 = fabs(res3rd - result);
+		    if (5.0 * err5 <= err3)
+			 R[iR].ee[j].err = err5;
+		    else
+			 R[iR].ee[j].err = 5.0 * (err5 > err3 ? err5 : err3);
+	       } else {
+		    R[iR].ee[j].err = fabs(res5th - result);
+	       }
 
 	       v += r_->num_points * fdim;
 	  }
@@ -585,7 +623,7 @@ static int rule75genzmalik_evalError(rule *r_, unsigned fdim, integrand_v f, voi
      return SUCCESS;
 }
 
-static rule *make_rule75genzmalik(unsigned dim, unsigned fdim)
+static rule *make_rule75genzmalik(unsigned dim, unsigned fdim, int robust)
 {
      rule75genzmalik *r;
 
@@ -613,6 +651,16 @@ static rule *make_rule75genzmalik(unsigned dim, unsigned fdim)
      r->weightE1 = (real(729 - 950 * to_int(dim) + 50 * isqr(to_int(dim)))
 		    / real(729));
      r->weightE3 = real(265 - 100 * to_int(dim)) / real(1458);
+
+     /* Degree-3 rule weights: integrates {1, x_i^2} exactly using only
+        the center (val0) and the lambda_2 axis points (sum2).
+        Derivation: solve w_c + 2*dim*w_2 = 1 (for f=1) and
+                           w_2 * 2 * lambda2^2 = 1/3 (for f=x_i^2)
+        with lambda2^2 = 9/70, giving w_2 = 35/27 and
+        w_c = 1 - 70*dim/27. */
+     r->weight3rd_2 = real(35) / real(27);
+     r->weight3rd_1 = real(1) - real(70 * to_int(dim)) / real(27);
+     r->robust = robust;
 
 	 r->df_scale = pow(10, dim); /* 10^dim */
 
@@ -867,8 +915,12 @@ static heap_item heap_pop(heap *h)
      int i, n, child;
 
      if (!(h->n)) {
+#ifdef _R_INTERFACE
+       Rf_error("hcubature.c: attempted to pop an empty heap\n");
+#else
 	  fprintf(stderr, "attempted to pop an empty heap\n");
 	  exit(EXIT_FAILURE);
+#endif
      }
 
      ret = h->items[0];
@@ -908,6 +960,52 @@ static int converged(unsigned fdim, const esterr *ee,
 #define VAL(j) ee[j].val
 #include "converged.h"
 
+/* Suspect-region detector: look for regions whose claimed density
+   (|val|/vol) is much smaller than the running peak density across
+   all evaluated regions so far, on a region that is still a
+   nontrivial fraction of the root volume. Such regions have likely
+   fallen into fool's convergence because their rule sample points
+   missed the integrand's active support entirely; their error
+   estimate is unreliable. Inflate the error so the region stays on
+   the split heap. */
+static void apply_suspect_check(region *R, size_t nR, unsigned fdim,
+				double *peak_density, double root_vol)
+{
+     const double DENSITY_RATIO = 1e-6;
+     const double VOL_FRACTION  = 0.1;
+     size_t i;
+     unsigned j;
+     /* Pass 1: update peak_density based on newly-evaluated regions. */
+     for (i = 0; i < nR; ++i) {
+	  if (R[i].h.vol <= 0) continue;
+	  for (j = 0; j < fdim; ++j) {
+	       double d = fabs(R[i].ee[j].val) / R[i].h.vol;
+	       if (d > *peak_density) *peak_density = d;
+	  }
+     }
+     if (*peak_density <= 0) return; /* nothing observed yet */
+     /* Pass 2: mark suspect regions and inflate their reported error. */
+     for (i = 0; i < nR; ++i) {
+	  int suspect = 0;
+	  if (R[i].h.vol <= VOL_FRACTION * root_vol) continue;
+	  for (j = 0; j < fdim; ++j) {
+	       double d = fabs(R[i].ee[j].val) / R[i].h.vol;
+	       if (d < DENSITY_RATIO * (*peak_density)) {
+		    suspect = 1;
+		    break;
+	       }
+	  }
+	  if (suspect) {
+	       double infl = R[i].h.vol * (*peak_density);
+	       for (j = 0; j < fdim; ++j) {
+		    if (R[i].ee[j].err < infl)
+			 R[i].ee[j].err = infl;
+	       }
+	       R[i].errmax = errMax(fdim, R[i].ee);
+	  }
+     }
+}
+
 /***************************************************************************/
 
 /* adaptive integration, analogous to adaptintegrator.cpp in HIntLib */
@@ -918,7 +1016,7 @@ static int rulecubature(rule *r, unsigned fdim,
 			size_t maxEval,
 			double reqAbsError, double reqRelError,
 			error_norm norm,
-			double *val, double *err, int parallel)
+			double *val, double *err, int parallel, int robust)
 {
      size_t numEval = 0;
      heap regions;
@@ -926,6 +1024,24 @@ static int rulecubature(rule *r, unsigned fdim,
      region *R = NULL; /* array of regions to evaluate */
      size_t nR_alloc = 0;
      esterr *ee = NULL;
+     /* When robust is set, we apply a Cuba/Cuhre-style parent-child
+        consistency check when splitting a region: if the sum of the
+        children's rule estimates disagrees with the parent's prior
+        estimate, the children's errors are inflated accordingly. This
+        catches fool's-convergence at the parent level. parent_ee is a
+        scratch buffer of 2*fdim doubles per split pair (val, err). */
+     double *parent_ee = NULL;
+     size_t parent_ee_alloc = 0;
+     /* When robust is set, we also track peak integrand density
+        (max |val| / vol) across all evaluated regions and use it to
+        detect "suspiciously empty" regions: any region whose density
+        is far below the peak and whose volume is still a nontrivial
+        fraction of the root is untrustworthy (it likely fell into
+        fool's convergence because its sample points miss the active
+        support), and gets its error forcibly inflated to push it back
+        onto the split heap. */
+     double peak_density = 0;
+     double root_vol = h->vol;
 
      if (fdim <= 1) norm = ERROR_INDIVIDUAL; /* norm is irrelevant */
      if (norm < 0 || norm > ERROR_LINF) return FAILURE; /* invalid norm */
@@ -941,9 +1057,11 @@ static int rulecubature(rule *r, unsigned fdim,
      if (!R) goto bad;
      R[0] = make_region(h, fdim);
      if (!R[0].ee
-	 || eval_regions(1, R, f, fdata, r)
-	 || heap_push(&regions, R[0]))
+	 || eval_regions(1, R, f, fdata, r))
 	       goto bad;
+     if (robust)
+	  apply_suspect_check(R, 1, fdim, &peak_density, root_vol);
+     if (heap_push(&regions, R[0])) goto bad;
      numEval += r->num_points;
 
      while (numEval < maxEval || !maxEval) {
@@ -986,7 +1104,27 @@ static int rulecubature(rule *r, unsigned fdim,
 			 R = (region *) realloc(R, nR_alloc * sizeof(region));
 			 if (!R) goto bad;
 		    }
+		    if (robust) {
+			 /* grow parent_ee in lockstep: one slot of 2*fdim
+			    doubles (val, err) per split pair */
+			 if ((nR/2 + 1) * 2 * fdim > parent_ee_alloc) {
+			      parent_ee_alloc = nR_alloc * fdim;
+			      parent_ee = (double *) realloc(parent_ee,
+				   sizeof(double) * parent_ee_alloc);
+			      if (!parent_ee) goto bad;
+			 }
+		    }
 		    R[nR] = heap_pop(&regions);
+		    if (robust) {
+			 /* snapshot parent val/err before cut_region
+			    clobbers them */
+			 for (j = 0; j < fdim; ++j) {
+			      parent_ee[(nR/2)*2*fdim + 2*j]
+				   = R[nR].ee[j].val;
+			      parent_ee[(nR/2)*2*fdim + 2*j + 1]
+				   = R[nR].ee[j].err;
+			 }
+		    }
 		    for (j = 0; j < fdim; ++j) ee[j].err -= R[nR].ee[j].err;
 		    if (cut_region(R+nR, R+nR+1)) goto bad;
 		    numEval += r->num_points * 2;
@@ -994,16 +1132,77 @@ static int rulecubature(rule *r, unsigned fdim,
 		    if (converged(fdim, ee, reqAbsError, reqRelError, norm))
 			 break; /* other regions have small errs */
 	       } while (regions.n > 0 && (numEval < maxEval || !maxEval));
-	       if (eval_regions(nR, R, f, fdata, r)
-		   || heap_push_many(&regions, nR, R))
-		    goto bad;
+	       if (eval_regions(nR, R, f, fdata, r)) goto bad;
+	       if (robust) {
+		    /* Parent-child consistency check: inflate each child
+		       pair's error by the discrepancy between the sum of
+		       the children's rule estimates and the parent's prior
+		       estimate. See Berntsen, Espelid & Genz, ACM TOMS
+		       17(4), 437-451 (1991); Cuba/Cuhre Integrate.c uses
+		       the equivalent formula. */
+		    size_t p;
+		    for (p = 0; p < nR; p += 2) {
+			 for (j = 0; j < fdim; ++j) {
+			      double pv = parent_ee[(p/2)*2*fdim + 2*j];
+			      double diff = fabs(R[p].ee[j].val
+					       + R[p+1].ee[j].val - pv);
+			      double esum = R[p].ee[j].err + R[p+1].ee[j].err;
+			      if (esum > 0) {
+				   double c = 1.0 + 2.0 * diff / esum;
+				   R[p].ee[j].err   *= c;
+				   R[p+1].ee[j].err *= c;
+			      }
+			      R[p].ee[j].err   += diff;
+			      R[p+1].ee[j].err += diff;
+			 }
+			 R[p].errmax   = errMax(fdim, R[p].ee);
+			 R[p+1].errmax = errMax(fdim, R[p+1].ee);
+		    }
+		    apply_suspect_check(R, nR, fdim, &peak_density, root_vol);
+	       }
+	       if (heap_push_many(&regions, nR, R)) goto bad;
 	  }
 	  else { /* minimize number of function evaluations */
+	       if (robust) {
+		    /* ensure parent_ee has one slot (2*fdim doubles) */
+		    if (parent_ee_alloc < 2 * fdim) {
+			 parent_ee_alloc = 2 * fdim;
+			 parent_ee = (double *) realloc(parent_ee,
+			      sizeof(double) * parent_ee_alloc);
+			 if (!parent_ee) goto bad;
+		    }
+	       }
 	       R[0] = heap_pop(&regions); /* get worst region */
+	       if (robust) {
+		    /* snapshot parent val/err before cut_region clobbers */
+		    for (j = 0; j < fdim; ++j) {
+			 parent_ee[2*j]     = R[0].ee[j].val;
+			 parent_ee[2*j + 1] = R[0].ee[j].err;
+		    }
+	       }
 	       if (cut_region(R, R+1)
-		   || eval_regions(2, R, f, fdata, r)
-		   || heap_push_many(&regions, 2, R))
+		   || eval_regions(2, R, f, fdata, r))
 		    goto bad;
+	       if (robust) {
+		    /* Parent-child consistency check (see parallel branch) */
+		    for (j = 0; j < fdim; ++j) {
+			 double pv = parent_ee[2*j];
+			 double diff = fabs(R[0].ee[j].val
+					  + R[1].ee[j].val - pv);
+			 double esum = R[0].ee[j].err + R[1].ee[j].err;
+			 if (esum > 0) {
+			      double c = 1.0 + 2.0 * diff / esum;
+			      R[0].ee[j].err *= c;
+			      R[1].ee[j].err *= c;
+			 }
+			 R[0].ee[j].err += diff;
+			 R[1].ee[j].err += diff;
+		    }
+		    R[0].errmax = errMax(fdim, R[0].ee);
+		    R[1].errmax = errMax(fdim, R[1].ee);
+		    apply_suspect_check(R, 2, fdim, &peak_density, root_vol);
+	       }
+	       if (heap_push_many(&regions, 2, R)) goto bad;
 	       numEval += r->num_points * 2;
 	  }
      }
@@ -1018,14 +1217,29 @@ static int rulecubature(rule *r, unsigned fdim,
 	  destroy_region(&regions.items[i]);
      }
 
-     /* printf("regions.nalloc = %d\n", regions.nalloc); */
-     free(ee);
-     heap_free(&regions);
-     free(R);
-     return SUCCESS;
+     /* Did we exit the main loop because we hit the convergence check
+        or because we ran out of maxEval? Re-evaluate the check against
+        the final summed totals to give the caller an unambiguous
+        signal. We reuse the local `ee` scratch buffer for the check. */
+     {
+	  int final_status;
+	  for (j = 0; j < fdim; ++j) {
+	       ee[j].val = val[j];
+	       ee[j].err = err[j];
+	  }
+	  final_status = converged(fdim, ee, reqAbsError, reqRelError, norm)
+			 ? SUCCESS : NOT_CONVERGED;
+	  /* printf("regions.nalloc = %d\n", regions.nalloc); */
+	  free(ee);
+	  free(parent_ee);
+	  heap_free(&regions);
+	  free(R);
+	  return final_status;
+     }
 
 bad:
      free(ee);
+     free(parent_ee);
      heap_free(&regions);
      free(R);
      return FAILURE;
@@ -1035,7 +1249,7 @@ static int cubature(unsigned fdim, integrand_v f, void *fdata,
 		    unsigned dim, const double *xmin, const double *xmax,
 		    size_t maxEval, double reqAbsError, double reqRelError,
 		    error_norm norm,
-		    double *val, double *err, int parallel)
+		    double *val, double *err, int parallel, int robust)
 {
      rule *r;
      hypercube h;
@@ -1049,7 +1263,7 @@ static int cubature(unsigned fdim, integrand_v f, void *fdata,
 	  return SUCCESS;
      }
      r = dim == 1 ? make_rule15gauss(dim, fdim)
- 	          : make_rule75genzmalik(dim, fdim);
+ 	          : make_rule75genzmalik(dim, fdim, robust);
      if (!r) {
 	  for (i = 0; i < fdim; ++i) {
 	       val[i] = 0;
@@ -1061,7 +1275,7 @@ static int cubature(unsigned fdim, integrand_v f, void *fdata,
      status = !h.data ? FAILURE
 	  : rulecubature(r, fdim, f, fdata, &h,
 				maxEval, reqAbsError, reqRelError, norm,
-				val, err, parallel);
+				val, err, parallel, robust);
      destroy_hypercube(&h);
      destroy_rule(r);
      return status;
@@ -1074,7 +1288,19 @@ int hcubature_v(unsigned fdim, integrand_v f, void *fdata,
                 double *val, double *err)
 {
      return cubature(fdim, f, fdata, dim, xmin, xmax,
-		     maxEval, reqAbsError, reqRelError, norm, val, err, 1);
+		     maxEval, reqAbsError, reqRelError, norm, val, err,
+		     /*parallel=*/1, /*robust=*/0);
+}
+
+int hcubature_v_robust(unsigned fdim, integrand_v f, void *fdata,
+		       unsigned dim, const double *xmin, const double *xmax,
+		       size_t maxEval, double reqAbsError, double reqRelError,
+		       error_norm norm,
+		       double *val, double *err, int robust)
+{
+     return cubature(fdim, f, fdata, dim, xmin, xmax,
+		     maxEval, reqAbsError, reqRelError, norm, val, err,
+		     /*parallel=*/1, robust);
 }
 
 #include "vwrapper.h"
@@ -1092,7 +1318,26 @@ int hcubature(unsigned fdim, integrand f, void *fdata,
 
      d.f = f; d.fdata = fdata;
      ret = cubature(fdim, fv, &d, dim, xmin, xmax,
-		    maxEval, reqAbsError, reqRelError, norm, val, err, 0);
+		    maxEval, reqAbsError, reqRelError, norm, val, err,
+		    /*parallel=*/0, /*robust=*/0);
+     return ret;
+}
+
+int hcubature_robust(unsigned fdim, integrand f, void *fdata,
+		     unsigned dim, const double *xmin, const double *xmax,
+		     size_t maxEval, double reqAbsError, double reqRelError,
+		     error_norm norm,
+		     double *val, double *err, int robust)
+{
+     int ret;
+     fv_data d;
+
+     if (fdim == 0) return SUCCESS; /* nothing to do */
+
+     d.f = f; d.fdata = fdata;
+     ret = cubature(fdim, fv, &d, dim, xmin, xmax,
+		    maxEval, reqAbsError, reqRelError, norm, val, err,
+		    /*parallel=*/0, robust);
      return ret;
 }
 
