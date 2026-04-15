@@ -916,7 +916,12 @@ static heap_item heap_pop(heap *h)
 
      if (!(h->n)) {
 #ifdef _R_INTERFACE
-       Rf_error("hcubature.c: attempted to pop an empty heap\n");
+       /* Parenthesized to silence the Rcpp Rf_error-scanner warning
+          (RcppCore/Rcpp#1247). This is a catastrophic-corruption
+          error path inside pure C heap code with no C++ objects on
+          the stack, so the longjmp semantics of Rf_error are safe
+          here and Rcpp::stop is not applicable. */
+       (Rf_error)("hcubature.c: attempted to pop an empty heap\n");
 #else
 	  fprintf(stderr, "attempted to pop an empty heap\n");
 	  exit(EXIT_FAILURE);
